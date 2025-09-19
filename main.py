@@ -4,6 +4,7 @@ import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
+from decimal import Decimal, ROUND_HALF_UP
 
 import httpx
 from fastapi import FastAPI
@@ -195,6 +196,9 @@ class MintRow:
     ln_name: str | None
     ln_capacity: str | None
     avg_latency_ms: int | None
+    is_up: bool
+    uptime_class: str
+    latency_class: str
 
 
 def compute_rows() -> list[MintRow]:
@@ -211,12 +215,15 @@ def compute_rows() -> list[MintRow]:
                 .limit(500)
             ).all()
             last_time = recent[0].checked_at if recent else None
+            if last_time and last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=timezone.utc)
             last_seen = (
-                last_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+                f"{max(0, int((now - last_time).total_seconds()))}s"
                 if last_time
                 else "-"
             )
             last50 = [hc.status for hc in recent]
+            is_up = bool(recent and recent[0].status)
             lns = s.exec(
                 select(LightningSnapshot)
                 .where(LightningSnapshot.mint_id == m.id)
@@ -226,7 +233,17 @@ def compute_rows() -> list[MintRow]:
             pubkey = lns.payee_pubkey if lns else None
             node_name = lns.node_name if lns else None
             cap = lns.node_capacity_sats if lns else None
-            cap_str = f"{cap:,} sats" if cap is not None else None
+            cap_str = None
+            if cap is not None:
+                btc = Decimal(cap) / Decimal(100_000_000)
+                if btc >= Decimal(10):
+                    decimals, q = 1, Decimal("0.1")
+                elif btc >= Decimal(1):
+                    decimals, q = 2, Decimal("0.01")
+                else:
+                    decimals, q = 4, Decimal("0.0001")
+                value = btc.quantize(q, rounding=ROUND_HALF_UP)
+                cap_str = f"{value:,.{decimals}f} BTC"
             since = s.exec(
                 select(HealthCheck).where(
                     HealthCheck.mint_id == m.id,
@@ -244,6 +261,24 @@ def compute_rows() -> list[MintRow]:
                 int(sum(avg_samples) / len(avg_samples)) if avg_samples else None
             )
             uptime_ratio = (up / total) if total else -1.0
+            uptime_class = (
+                "none"
+                if total == 0
+                else (
+                    "good"
+                    if uptime_ratio >= 0.995
+                    else ("warn" if uptime_ratio >= 0.97 else "bad")
+                )
+            )
+            latency_class = (
+                "none"
+                if avg_latency is None
+                else (
+                    "fast"
+                    if avg_latency <= 300
+                    else ("ok" if avg_latency <= 1000 else "slow")
+                )
+            )
             row = MintRow(
                 url=m.url,
                 uptime_24h=(f"{(uptime_ratio*100):.0f}%" if total else "-"),
@@ -253,6 +288,9 @@ def compute_rows() -> list[MintRow]:
                 ln_name=node_name,
                 ln_capacity=cap_str,
                 avg_latency_ms=avg_latency,
+                is_up=is_up,
+                uptime_class=uptime_class,
+                latency_class=latency_class,
             )
             cap_num = cap if cap is not None else -1
             lat_sort = avg_latency if avg_latency is not None else 1_000_000_000
@@ -263,26 +301,39 @@ def compute_rows() -> list[MintRow]:
 
 def render_tbody() -> str:
     rows = compute_rows()
-    body = "".join(
-        f"<tr>"
-        f"<td class=mono>{r.url}</td>"
-        f"<td>{r.uptime_24h}</td>"
-        f"<td class=mono>{r.last_seen}</td>"
-        f"<td><div class=spark>{r.checks_html}</div></td>"
-        f"<td class=mono>{(f'<a href=\'https://1ml.com/node/{r.ln_pubkey}\' target=\'_blank\'>{r.ln_name or r.ln_pubkey}</a>') if r.ln_pubkey else '-'}</td>"
-        f"<td>{r.ln_capacity or '-'}</td>"
-        f"<td class=mono>{(str(r.avg_latency_ms) + ' ms') if r.avg_latency_ms is not None else '-'}</td>"
-        f"</tr>"
-        for r in rows
+    with_cap = [r for r in rows if r.ln_capacity is not None]
+    no_cap = [r for r in rows if r.ln_capacity is None]
+
+    def row_html(r: MintRow, extra_class: str = "") -> str:
+        classes = (
+            f"{'up' if r.is_up else 'down'}{(' ' + extra_class) if extra_class else ''}"
+        )
+        return (
+            f"<tr class={classes}>"
+            f"<td class=mint><span class=\"status-dot {'up' if r.is_up else 'down'}\" title=\"{'Up' if r.is_up else 'Down'}\"></span><a class=link href=\"{r.url}\" target=\"_blank\" rel=\"noopener\">{r.url.replace('https://','').replace('http://','')}</a></td>"
+            f"<td><span class=\"badge uptime {r.uptime_class}\" title=\"Uptime last 24h\">{r.uptime_24h}</span></td>"
+            f"<td><div class=spark>{r.checks_html}</div></td>"
+            f"<td class=mono>{(f'<a class=\'link\' href=\'https://1ml.com/node/{r.ln_pubkey}\' target=\'_blank\' rel=\'noopener\'>{r.ln_name or r.ln_pubkey}</a>') if r.ln_pubkey else '-'}</td>"
+            f"<td>{(f'<span class=\'badge cap\'>{r.ln_capacity}</span>') if r.ln_capacity else '-'}</td>"
+            f"<td>{(f'<span class=\'badge latency {r.latency_class}\'>{r.avg_latency_ms} ms</span>') if r.avg_latency_ms is not None else '-'}</td>"
+            f"</tr>"
+        )
+
+    body_main = "".join(row_html(r) for r in with_cap)
+    body_no_cap = "".join(row_html(r, "no-cap") for r in no_cap)
+    divider = (
+        '<tr class="section-divider"><td colspan="6"><span>Node not found</span></td></tr>'
+        if body_no_cap
+        else ""
     )
-    return f"<tbody id=dashboard>{body}</tbody>"
+    return f"<tbody id=dashboard>{body_main}{divider}{body_no_cap}</tbody>"
 
 
 def render_table() -> str:
     tbody = render_tbody()
     return (
         "<table class=card>"
-        "<thead><tr><th>Mint</th><th>Uptime (24h)</th><th>Last Check</th><th>Last 50</th><th>LN Node</th><th>LN Capacity</th><th>Avg Latency</th></tr></thead>"
+        "<thead><tr><th>Mint</th><th>Uptime (24h)</th><th>Last hour</th><th>LN Node</th><th>LN Capacity (BTC)</th><th>Latency</th></tr></thead>"
         f"{tbody}"
         "</table>"
     )
@@ -290,38 +341,62 @@ def render_table() -> str:
 
 def render_index() -> str:
     styles = """
-    :root{color-scheme:light dark}
+    :root{color-scheme:dark;--bg:#0a0b0f;--surface:#101216;--surface-2:#0f1114;--border:#1f2937;--text:#e5e7eb;--muted:#9ca3af;--accent:#60a5fa;--green:#16a34a;--red:#ef4444;--amber:#f59e0b}
     *{box-sizing:border-box}
-    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;line-height:1.4;background:#0b0b0c;color:#e5e7eb}
-    header{padding:20px 16px;max-width:1060px;margin:0 auto}
-    h1{margin:0;font-size:22px;font-weight:600}
-    main{padding:0 16px 40px;max-width:1060px;margin:0 auto}
-    .card{width:100%;border-collapse:separate;border-spacing:0;background:#111214;border:1px solid #1f2937;border-radius:12px;overflow:hidden}
-    th,td{padding:12px 14px;border-bottom:1px solid #1f2937;text-align:left;font-size:14px}
-    thead th{position:sticky;top:0;background:#0f1113;z-index:1}
+    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;line-height:1.5;background:var(--bg);color:var(--text)}
+    header{padding:24px 16px 12px;max-width:1100px;margin:0 auto}
+    h1{margin:0;font-size:24px;font-weight:700;letter-spacing:.2px}
+    .sub{margin-top:6px;color:var(--muted);font-size:13px}
+    main{padding:8px 16px 44px;max-width:1100px;margin:0 auto}
+    .card{width:100%;border-collapse:separate;border-spacing:0;background:linear-gradient(180deg,var(--surface),var(--surface-2));border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:0 10px 30px #00000055}
+    th,td{padding:13px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:14px}
+    thead th{position:sticky;top:0;background:#0c0f13;z-index:1;font-weight:600;color:#cbd5e1}
+    tbody tr{transition:background .15s ease}
+    tbody tr:hover{background:#0f1217}
     tbody tr:last-child td{border-bottom:none}
-    .spark{display:grid;grid-template-columns:repeat(50, minmax(2px, 1fr));gap:2px}
-    .cell{display:block;aspect-ratio:1/1;border-radius:2px}
+    tbody tr.up td.mint .status-dot{background:linear-gradient(180deg,#10b981,#16a34a);box-shadow:0 0 0 2px #0b0f14,0 0 12px #10b98155}
+    tbody tr.down td.mint .status-dot{background:linear-gradient(180deg,#ef4444,#dc2626);box-shadow:0 0 0 2px #0b0f14,0 0 10px #ef444455}
+    tbody tr.no-cap{opacity:.55}
+    tr.section-divider td{background:#0c0f13;border-top:2px solid #0b0e12;border-bottom:2px solid #0b0e12;color:#94a3b8;font-weight:600}
+    tr.section-divider td span{display:inline-block;padding:8px 6px}
+    .spark{display:grid;grid-template-columns:repeat(50,minmax(2px,1fr));gap:2px}
+    .cell{display:block;aspect-ratio:1/1;border-radius:2px;opacity:.95}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px}
-    .muted{color:#9ca3af}
-    footer{max-width:1060px;margin:10px auto 0;padding:0 16px;color:#9ca3af;font-size:12px}
-    a{color:#93c5fd;text-decoration:none}
+    .muted{color:var(--muted)}
+    .mint{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:0;min-width:280px}
+    .mint .status-dot{display:inline-block;width:10px;height:10px;border-radius:999px;margin-right:10px;vertical-align:middle}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:600;letter-spacing:.2px}
+    .badge.uptime.none{background:#0f1318;color:#64748b}
+    .badge.uptime.good{background:#052e1a;color:#22c55e}
+    .badge.uptime.warn{background:#2a2105;color:#eab308}
+    .badge.uptime.bad{background:#2d0c0c;color:#f87171}
+    .badge.latency.none{background:#0f1318;color:#64748b}
+    .badge.latency.fast{background:#062b1a;color:#16a34a}
+    .badge.latency.ok{background:#2a2105;color:#f59e0b}
+    .badge.latency.slow{background:#2d0c0c;color:#f87171}
+    .badge.cap{background:#0f1318;color:#93c5fd}
+    a{color:var(--accent);text-decoration:none}
     a:hover{text-decoration:underline}
+    footer{max-width:1100px;margin:12px auto 0;padding:0 16px;color:var(--muted);font-size:12px}
+    #meta{display:flex;gap:14px;align-items:center;margin-top:8px;color:var(--muted);font-size:12px}
+    #last-updated{font-variant-numeric:tabular-nums}
     """.strip()
     return (
         "<!doctype html><html><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width, initial-scale=1">'
+        '<meta name="theme-color" content="#0a0b0f">'
         "<title>Cashu Mint Status</title>"
         f"<style>{styles}</style>"
         '<script src="https://unpkg.com/htmx.org@2.0.2" integrity="sha384-7Y/OLJm7GG4l7uYf4x2nY2hVqXzjP4uYbUhg0oMiJ2z2hQ0zDgANbHgxqCwR8K8y" crossorigin="anonymous"></script>'
         "</head><body>"
-        "<header><h1>Cashu Mint Status Board <span class=muted>(refreshes every 10s)</span></h1></header>"
+        "<header><h1>Cashu Mint Status Board</h1><div id=meta><span class=muted>Auto-refresh every 10s</span><span class=muted>•</span><span class=muted>Last updated: <strong id=last-updated>-</strong></span></div></header>"
         "<main>"
         '<div hx-get="/dashboard" hx-trigger="load, every 10s" hx-target="#dashboard" hx-swap="outerHTML">'
         f"{render_table()}"
         "</div>"
         "</main>"
         "<footer>Built with FastAPI, HTMX, SQLModel.</footer>"
+        "<script>document.addEventListener('htmx:afterSwap',function(e){if(e.detail && e.detail.target && e.detail.target.id==='dashboard'){var el=document.getElementById('last-updated');if(el){var d=new Date();el.textContent=d.toLocaleTimeString();}}});</script>"
         "</body></html>"
     )
 
