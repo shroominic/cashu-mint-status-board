@@ -395,7 +395,6 @@ def render_index() -> str:
         f"{render_table()}"
         "</div>"
         "</main>"
-        "<footer>Built with FastAPI, HTMX, SQLModel.</footer>"
         "<script>document.addEventListener('htmx:afterSwap',function(e){if(e.detail && e.detail.target && e.detail.target.id==='dashboard'){var el=document.getElementById('last-updated');if(el){var d=new Date();el.textContent=d.toLocaleTimeString();}}});</script>"
         "</body></html>"
     )
