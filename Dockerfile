@@ -10,4 +10,4 @@ COPY . .
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["/.venv/bin/python", "main.py"]
+CMD ["/.venv/bin/fastapi", "run"]

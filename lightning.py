@@ -1,5 +1,4 @@
 import asyncio
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +12,7 @@ class LightningProbeResult:
     payee_pubkey: str | None
     node_name: str | None
     node_capacity_sats: int | None
+    node_channel_count: int | None
 
 
 async def fetch_invoice_request(
@@ -39,55 +39,31 @@ def decode_invoice_pubkey(invoice: str) -> str | None:
         return None
 
 
-def _parse_capacity_sats_from_html(html: str) -> int | None:
-    for m in re.finditer(r"([0-9][0-9,._ ]{0,20})\s*sats", html, flags=re.IGNORECASE):
-        digits = re.sub(r"[^0-9]", "", m.group(1))
-        if digits:
-            value = int(digits)
-            if value > 1000:
-                return value
-    m_btc = re.search(r"([0-9]+(?:\.[0-9]{1,8})?)\s*BTC", html, flags=re.IGNORECASE)
-    if m_btc:
-        return int(float(m_btc.group(1)) * 100_000_000)
-    return None
-
-
-def _parse_node_name_from_html(html: str) -> str | None:
-    m = re.search(r"\"alias\"\s*:\s*\"([^\"]+)\"", html)
-    if m:
-        return m.group(1)
-    m2 = re.search(
-        r"<title>\s*(.*?)\s*[\-\u2013\u2014]\s*1ML", html, flags=re.IGNORECASE
-    )
-    if m2:
-        return re.sub(r"\s+", " ", m2.group(1)).strip()
-    m3 = re.search(
-        r"Alias\s*</td>\s*<td[^>]*>\s*([^<]+)\s*</td>", html, flags=re.IGNORECASE
-    )
-    if m3:
-        return m3.group(1).strip()
-    return None
-
-
-async def fetch_node_alias_and_capacity(
+async def fetch_node_metadata(
     pubkey: str, client: httpx.AsyncClient
-) -> tuple[str | None, int | None]:
+) -> tuple[str | None, int | None, int | None]:
     try:
-        r1 = await client.get(f"https://1ml.com/node/{pubkey}/channels?order=capacity")
-        alias: str | None = None
-        cap1: int | None = None
-        if r1.status_code == 200:
-            cap1 = _parse_capacity_sats_from_html(r1.text)
-            alias = _parse_node_name_from_html(r1.text) or alias
-        r2 = await client.get(f"https://1ml.com/node/{pubkey}")
-        cap2: int | None = None
-        if r2.status_code == 200:
-            cap2 = _parse_capacity_sats_from_html(r2.text)
-            alias = _parse_node_name_from_html(r2.text) or alias
-        cap = cap1 if cap1 is not None else cap2
-        return alias, cap
+        r = await client.get(f"https://1ml.com/node/{pubkey}/json")
+        if r.status_code != 200:
+            return None, None, None
+        data = r.json()
+        alias_val = data.get("alias")
+        alias: str | None = alias_val if isinstance(alias_val, str) else None
+        cap_val = data.get("capacity")
+        capacity: int | None = (
+            int(cap_val)
+            if isinstance(cap_val, (int, str)) and str(cap_val).isdigit()
+            else None
+        )
+        ch_val = data.get("channelcount")
+        channels: int | None = (
+            int(ch_val)
+            if isinstance(ch_val, (int, str)) and str(ch_val).isdigit()
+            else None
+        )
+        return alias, capacity, channels
     except Exception:
-        return None, None
+        return None, None, None
 
 
 async def probe_lightning(
@@ -95,14 +71,15 @@ async def probe_lightning(
 ) -> LightningProbeResult:
     invoice, _ = await fetch_invoice_request(mint_url, client)
     pubkey = decode_invoice_pubkey(invoice) if invoice else None
-    node_name, capacity = (
-        await fetch_node_alias_and_capacity(pubkey, client) if pubkey else (None, None)
+    name, capacity, channels = (
+        await fetch_node_metadata(pubkey, client) if pubkey else (None, None, None)
     )
     return LightningProbeResult(
         invoice=invoice,
         payee_pubkey=pubkey,
-        node_name=node_name,
+        node_name=name,
         node_capacity_sats=capacity,
+        node_channel_count=channels,
     )
 
 

@@ -42,6 +42,7 @@ class LightningSnapshot(SQLModel, table=True):
     payee_pubkey: str | None = Field(default=None, index=True)
     node_name: str | None = None
     node_capacity_sats: int | None = None
+    node_channel_count: int | None = None
     checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -58,6 +59,13 @@ class MintListing(BaseModel):
 
 def create_db() -> None:
     SQLModel.metadata.create_all(engine)
+    with engine.connect() as conn:
+        cols = conn.exec_driver_sql("PRAGMA table_info('lightningsnapshot')").fetchall()
+        names = {c[1] for c in cols}
+        if "node_channel_count" not in names:
+            conn.exec_driver_sql(
+                "ALTER TABLE lightningsnapshot ADD COLUMN node_channel_count INTEGER"
+            )
 
 
 async def fetch_nostr_mints() -> list[MintListing]:
@@ -170,6 +178,7 @@ async def lightning_loop(stop: asyncio.Event) -> None:
                         payee_pubkey=res.payee_pubkey,
                         node_name=res.node_name,
                         node_capacity_sats=res.node_capacity_sats,
+                        node_channel_count=res.node_channel_count,
                     )
                 )
             s.commit()
@@ -195,6 +204,7 @@ class MintRow:
     ln_pubkey: str | None
     ln_name: str | None
     ln_capacity: str | None
+    ln_channels: int | None
     avg_latency_ms: int | None
     is_up: bool
     uptime_class: str
@@ -233,6 +243,7 @@ def compute_rows() -> list[MintRow]:
             pubkey = lns.payee_pubkey if lns else None
             node_name = lns.node_name if lns else None
             cap = lns.node_capacity_sats if lns else None
+            channels = lns.node_channel_count if lns else None
             cap_str = None
             if cap is not None:
                 btc = Decimal(cap) / Decimal(100_000_000)
@@ -287,6 +298,7 @@ def compute_rows() -> list[MintRow]:
                 ln_pubkey=pubkey,
                 ln_name=node_name,
                 ln_capacity=cap_str,
+                ln_channels=channels,
                 avg_latency_ms=avg_latency,
                 is_up=is_up,
                 uptime_class=uptime_class,
@@ -308,12 +320,23 @@ def render_tbody() -> str:
         classes = (
             f"{'up' if r.is_up else 'down'}{(' ' + extra_class) if extra_class else ''}"
         )
+        node_cell = (
+            (
+                f"<a class='link' href='https://1ml.com/node/{r.ln_pubkey}' target='_blank' rel='noopener'>{r.ln_name}</a>"
+                if r.ln_pubkey
+                else r.ln_name
+            )
+            if r.ln_name
+            else "-"
+        )
+        channels_cell = f"{r.ln_channels}" if r.ln_channels is not None else "-"
         return (
             f"<tr class={classes}>"
             f"<td class=mint><span class=\"status-dot {'up' if r.is_up else 'down'}\" title=\"{'Up' if r.is_up else 'Down'}\"></span><a class=link href=\"{r.url}\" target=\"_blank\" rel=\"noopener\">{r.url.replace('https://','').replace('http://','')}</a></td>"
             f"<td><span class=\"badge uptime {r.uptime_class}\" title=\"Uptime last 24h\">{r.uptime_24h}</span></td>"
             f"<td><div class=spark>{r.checks_html}</div></td>"
-            f"<td class=mono>{(f'<a class=\'link\' href=\'https://1ml.com/node/{r.ln_pubkey}\' target=\'_blank\' rel=\'noopener\'>{r.ln_name or r.ln_pubkey}</a>') if r.ln_pubkey else '-'}</td>"
+            f"<td class=mono>{node_cell}</td>"
+            f"<td>{channels_cell}</td>"
             f"<td>{(f'<span class=\'badge cap\'>{r.ln_capacity}</span>') if r.ln_capacity else '-'}</td>"
             f"<td>{(f'<span class=\'badge latency {r.latency_class}\'>{r.avg_latency_ms} ms</span>') if r.avg_latency_ms is not None else '-'}</td>"
             f"</tr>"
@@ -322,7 +345,7 @@ def render_tbody() -> str:
     body_main = "".join(row_html(r) for r in with_cap)
     body_no_cap = "".join(row_html(r, "no-cap") for r in no_cap)
     divider = (
-        '<tr class="section-divider"><td colspan="6"><span>Node not found</span></td></tr>'
+        '<tr class="section-divider"><td colspan="7"><span>Node not found</span></td></tr>'
         if body_no_cap
         else ""
     )
@@ -333,7 +356,7 @@ def render_table() -> str:
     tbody = render_tbody()
     return (
         "<table class=card>"
-        "<thead><tr><th>Mint</th><th>Uptime (24h)</th><th>Last hour</th><th>LN Node</th><th>LN Capacity (BTC)</th><th>Latency</th></tr></thead>"
+        "<thead><tr><th>Mint</th><th>Uptime (24h)</th><th>Last hour</th><th>LN Node</th><th>Channels</th><th>LN Capacity (BTC)</th><th>Latency</th></tr></thead>"
         f"{tbody}"
         "</table>"
     )
@@ -379,7 +402,6 @@ def render_index() -> str:
     a:hover{text-decoration:underline}
     footer{max-width:1100px;margin:12px auto 0;padding:0 16px;color:var(--muted);font-size:12px}
     #meta{display:flex;gap:14px;align-items:center;margin-top:8px;color:var(--muted);font-size:12px}
-    #last-updated{font-variant-numeric:tabular-nums}
     """.strip()
     return (
         "<!doctype html><html><head><meta charset=utf-8>"
@@ -389,13 +411,12 @@ def render_index() -> str:
         f"<style>{styles}</style>"
         '<script src="https://unpkg.com/htmx.org@2.0.2" integrity="sha384-7Y/OLJm7GG4l7uYf4x2nY2hVqXzjP4uYbUhg0oMiJ2z2hQ0zDgANbHgxqCwR8K8y" crossorigin="anonymous"></script>'
         "</head><body>"
-        "<header><h1>Cashu Mint Status Board</h1><div id=meta><span class=muted>Auto-refresh every 10s</span><span class=muted>•</span><span class=muted>Last updated: <strong id=last-updated>-</strong></span></div></header>"
+        "<header><h1>Cashu.Live</h1><div id=meta><span class=muted>Auto-refresh every 10s</span></div></header>"
         "<main>"
         '<div hx-get="/dashboard" hx-trigger="load, every 10s" hx-target="#dashboard" hx-swap="outerHTML">'
         f"{render_table()}"
         "</div>"
         "</main>"
-        "<script>document.addEventListener('htmx:afterSwap',function(e){if(e.detail && e.detail.target && e.detail.target.id==='dashboard'){var el=document.getElementById('last-updated');if(el){var d=new Date();el.textContent=d.toLocaleTimeString();}}});</script>"
         "</body></html>"
     )
 
