@@ -9,6 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from contextlib import asynccontextmanager
@@ -263,14 +264,6 @@ def compute_rows() -> list[MintRow]:
             ).all()
             up = sum(1 for hc in since if hc.status)
             total = len(since)
-            avg_samples = [
-                hc.response_ms
-                for hc in since
-                if hc.status and hc.response_ms is not None
-            ]
-            avg_latency = (
-                int(sum(avg_samples) / len(avg_samples)) if avg_samples else None
-            )
             uptime_ratio = (up / total) if total else -1.0
             uptime_class = (
                 "none"
@@ -279,15 +272,6 @@ def compute_rows() -> list[MintRow]:
                     "good"
                     if uptime_ratio >= 0.995
                     else ("warn" if uptime_ratio >= 0.97 else "bad")
-                )
-            )
-            latency_class = (
-                "none"
-                if avg_latency is None
-                else (
-                    "fast"
-                    if avg_latency <= 300
-                    else ("ok" if avg_latency <= 1000 else "slow")
                 )
             )
             row = MintRow(
@@ -299,14 +283,13 @@ def compute_rows() -> list[MintRow]:
                 ln_name=node_name,
                 ln_capacity=cap_str,
                 ln_channels=channels,
-                avg_latency_ms=avg_latency,
+                avg_latency_ms=None,
                 is_up=is_up,
                 uptime_class=uptime_class,
-                latency_class=latency_class,
+                latency_class="none",
             )
             cap_num = cap if cap is not None else -1
-            lat_sort = avg_latency if avg_latency is not None else 1_000_000_000
-            rows_with_metrics.append((cap_num, uptime_ratio, lat_sort, row))
+            rows_with_metrics.append((cap_num, uptime_ratio, 0, row))
     rows_with_metrics.sort(key=lambda t: (-t[0], -t[1], t[2]))
     return [r for _, _, _, r in rows_with_metrics]
 
@@ -410,6 +393,7 @@ def render_index() -> str:
         "<title>Cashu Mint Status</title>"
         f"<style>{styles}</style>"
         '<script src="https://unpkg.com/htmx.org@2.0.2" integrity="sha384-7Y/OLJm7GG4l7uYf4x2nY2hVqXzjP4uYbUhg0oMiJ2z2hQ0zDgANbHgxqCwR8K8y" crossorigin="anonymous"></script>'
+        '<script src="/static/latency.js" defer></script>'
         "</head><body>"
         "<header><h1>Cashu.Live</h1><div id=meta><span class=muted>Auto-refresh every 10s</span></div></header>"
         "<main>"
@@ -443,6 +427,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
