@@ -147,7 +147,13 @@ const LatencyMonitor = (() => {
             const linkElement = row.querySelector('td.mint a.link');
             if (!linkElement) continue;
 
-            const mintUrl = linkElement.href;
+            let mintUrl = linkElement.href;
+
+            // Force HTTPS for all mints
+            if (mintUrl.startsWith('http:')) {
+                mintUrl = mintUrl.replace('http:', 'https:');
+            }
+
             const latencyCell = row.querySelector('td:nth-last-child(1)');
             if (!latencyCell) continue;
 
