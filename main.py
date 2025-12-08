@@ -2,7 +2,6 @@ import asyncio
 import time
 import contextlib
 from dataclasses import dataclass
-import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 from decimal import Decimal, ROUND_HALF_UP
@@ -35,6 +34,10 @@ class HealthCheck(SQLModel, table=True):
     status: bool
     response_ms: int | None = None
     currency_count: int | None = None
+    # New fields for audit stats
+    n_errors: int | None = None
+    n_mints: int | None = None
+    n_melts: int | None = None
     checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -76,6 +79,12 @@ def create_db() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE healthcheck ADD COLUMN currency_count INTEGER"
             )
+        if "n_errors" not in names_hc:
+            conn.exec_driver_sql("ALTER TABLE healthcheck ADD COLUMN n_errors INTEGER")
+        if "n_mints" not in names_hc:
+            conn.exec_driver_sql("ALTER TABLE healthcheck ADD COLUMN n_mints INTEGER")
+        if "n_melts" not in names_hc:
+            conn.exec_driver_sql("ALTER TABLE healthcheck ADD COLUMN n_melts INTEGER")
 
 
 async def fetch_nostr_mints() -> list[MintListing]:
@@ -102,8 +111,8 @@ async def fetch_nostr_mints() -> list[MintListing]:
     ]
 
 
-async def fetch_audit_mints() -> list[str]:
-    urls = []
+async def fetch_audit_mints() -> list[dict[str, Any]]:
+    mints_data = []
     skip = 0
     limit = 100
     try:
@@ -118,34 +127,47 @@ async def fetch_audit_mints() -> list[str]:
                 if not data:
                     break
 
-                current_urls = [m["url"] for m in data if "url" in m]
-                urls.extend(current_urls)
+                mints_data.extend(data)
 
                 if len(data) < limit:
                     break
                 skip += limit
 
-                # Safety break to prevent infinite loops
                 if skip > 10000:
                     break
     except Exception:
         pass
-    return urls
+    return mints_data
 
 
 def extract_url(mint: MintListing) -> str | None:
     return next((tag[1] for tag in mint.tags if len(tag) >= 2 and tag[0] == "u"), None)
 
 
-async def discover_mint_urls() -> list[str]:
+async def discover_mint_urls() -> dict[str, dict[str, Any] | None]:
     nostr_task = asyncio.create_task(fetch_nostr_mints())
     audit_task = asyncio.create_task(fetch_audit_mints())
 
-    nostr_mints, audit_urls = await asyncio.gather(nostr_task, audit_task)
-    nostr_urls = [u for m in nostr_mints if (u := extract_url(m))]
+    nostr_mints, audit_data = await asyncio.gather(nostr_task, audit_task)
 
-    urls = nostr_urls + audit_urls
-    return sorted(set(urls))
+    # Map URL to extra data (or None)
+    result: dict[str, dict[str, Any] | None] = {}
+
+    # Process Nostr mints
+    for m in nostr_mints:
+        if u := extract_url(m):
+            if u not in result:
+                result[u] = None
+
+    # Process Audit mints
+    for m in audit_data:
+        if isinstance(m, dict) and "url" in m:
+            u = m["url"]
+            # We merge/overwrite because audit data has stats we want
+            # If we already have it from Nostr, we just attach the stats
+            result[u] = m  # type: ignore[index]
+
+    return result
 
 
 async def http_health(
@@ -163,7 +185,13 @@ async def http_health(
                 if "4" in nuts and "methods" in nuts["4"]:
                     methods = nuts["4"]["methods"]
                     # count unique units
-                    currencies = len({m[1] for m in methods if len(m) >= 2})
+                    units = set()
+                    for m in methods:
+                        if isinstance(m, dict):
+                            units.add(m.get("unit"))
+                        elif isinstance(m, (list, tuple)) and len(m) >= 2:
+                            units.add(m[1])
+                    currencies = len({u for u in units if u})
             except Exception:
                 pass
             return url, True, elapsed_ms, currencies
@@ -187,18 +215,30 @@ def ensure_mints(session: Session, urls: list[str]) -> dict[str, int]:
 
 async def monitor_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
-        urls = await discover_mint_urls()
+        url_data_map = await discover_mint_urls()
+        urls = sorted(list(url_data_map.keys()))
+
         async with httpx.AsyncClient(timeout=5.0) as client:
             results = await asyncio.gather(*[http_health(u, client) for u in urls])
+
         with Session(engine) as s:
             url_to_id = ensure_mints(s, [u for u, _, _, _ in results])
             for url, ok, ms, curs in results:
+                # Extract stats from audit data if available
+                extra = url_data_map.get(url)
+                n_errors = extra.get("n_errors") if extra else None
+                n_mints = extra.get("n_mints") if extra else None
+                n_melts = extra.get("n_melts") if extra else None
+
                 s.add(
                     HealthCheck(
                         mint_id=url_to_id[url],
                         status=ok,
                         response_ms=ms,
                         currency_count=curs,
+                        n_errors=n_errors,
+                        n_mints=n_mints,
+                        n_melts=n_melts,
                     )
                 )
             s.commit()
@@ -210,7 +250,8 @@ async def monitor_loop(stop: asyncio.Event) -> None:
 
 async def lightning_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
-        urls = await discover_mint_urls()
+        url_data_map = await discover_mint_urls()
+        urls = sorted(list(url_data_map.keys()))
         active_urls: list[str] = []
         with Session(engine) as s:
             url_to_id = ensure_mints(s, urls)
@@ -279,6 +320,10 @@ class MintRow:
     raw_uptime: float
     raw_capacity: int
     raw_channels: int
+    # New stats
+    n_errors: int
+    n_mints: int
+    n_melts: int
 
 
 def compute_rows() -> list[MintRow]:
@@ -308,6 +353,16 @@ def compute_rows() -> list[MintRow]:
                 recent[0].currency_count
                 if recent and recent[0].currency_count is not None
                 else None
+            )
+
+            n_errors = (
+                recent[0].n_errors if recent and recent[0].n_errors is not None else 0
+            )
+            n_mints = (
+                recent[0].n_mints if recent and recent[0].n_mints is not None else 0
+            )
+            n_melts = (
+                recent[0].n_melts if recent and recent[0].n_melts is not None else 0
             )
 
             latencies = [hc.response_ms for hc in recent if hc.response_ms is not None]
@@ -379,6 +434,9 @@ def compute_rows() -> list[MintRow]:
                 raw_uptime=uptime_ratio,
                 raw_capacity=cap if cap is not None else 0,
                 raw_channels=channels if channels is not None else 0,
+                n_errors=n_errors,
+                n_mints=n_mints,
+                n_melts=n_melts,
             )
             rows.append(row)
 
@@ -419,7 +477,10 @@ def render_tbody() -> str:
             f'data-capacity="{r.raw_capacity}" '
             f'data-channels="{r.raw_channels}" '
             f'data-currencies="{r.currencies if r.currencies is not None else 0}" '
-            f'data-latency="{r.avg_latency_ms if r.avg_latency_ms is not None else 99999}"'
+            f'data-errors="{r.n_errors}" '
+            f'data-mints="{r.n_mints}" '
+            f'data-melts="{r.n_melts}"'
+            f'data-latency="{r.avg_latency_ms if r.avg_latency_ms is not None else 99999}" '
         )
 
         return (
@@ -431,6 +492,9 @@ def render_tbody() -> str:
             f"<td>{channels_cell}</td>"
             f"<td>{(f'<span class=\'badge cap\'>{r.ln_capacity}</span>') if r.ln_capacity else '-'}</td>"
             f"<td class=currencies>{currencies_cell}</td>"
+            f"<td>{r.n_mints}</td>"
+            f"<td>{r.n_melts}</td>"
+            f"<td>{r.n_errors}</td>"
             f"<td>{(f'<span class=\'badge latency {r.latency_class}\'>{r.avg_latency_ms} ms</span>') if r.avg_latency_ms is not None else '-'}</td>"
             f"</tr>"
         )
@@ -451,6 +515,9 @@ def render_table() -> str:
         "<th class='sortable' data-key='channels'>Channels</th>"
         "<th class='sortable' data-key='capacity'>LN Capacity (BTC)</th>"
         "<th class='sortable' data-key='currencies'>Currencies</th>"
+        "<th class='sortable' data-key='mints'>Mints</th>"
+        "<th class='sortable' data-key='melts'>Melts</th>"
+        "<th class='sortable' data-key='errors'>Errors</th>"
         "<th class='sortable' data-key='latency'>Latency</th>"
         "</tr></thead>"
         f"{tbody}"
@@ -529,6 +596,18 @@ def render_index() -> str:
             <div class="config-item">
                 <label>Capacity Weight <span class="val" id="val-cap">500</span></label>
                 <input type="range" id="w_capacity" min="0" max="2000" step="50" value="500">
+            </div>
+            <div class="config-item">
+                <label>Mints Weight <span class="val" id="val-mints">10</span></label>
+                <input type="range" id="w_mints" min="0" max="100" step="1" value="10">
+            </div>
+            <div class="config-item">
+                <label>Melts Weight <span class="val" id="val-melts">10</span></label>
+                <input type="range" id="w_melts" min="0" max="100" step="1" value="10">
+            </div>
+            <div class="config-item">
+                <label>Errors Penalty <span class="val" id="val-errors">100</span></label>
+                <input type="range" id="w_errors" min="0" max="1000" step="10" value="100">
             </div>
             <div class="config-item">
                 <label>Latency Penalty <span class="val" id="val-lat">1</span></label>

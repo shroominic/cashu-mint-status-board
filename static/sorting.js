@@ -4,7 +4,10 @@ const MintSorter = (() => {
         status: true,
         currency: 1000,
         capacity: 500,
-        latency: 1
+        latency: 1,
+        mints: 10,
+        melts: 10,
+        errors: 100
     };
 
     // State
@@ -23,12 +26,18 @@ const MintSorter = (() => {
             status: null,
             currency: null,
             capacity: null,
-            latency: null
+            latency: null,
+            mints: null,
+            melts: null,
+            errors: null
         },
         displays: {
             currency: null,
             capacity: null,
-            latency: null
+            latency: null,
+            mints: null,
+            melts: null,
+            errors: null
         },
         resetBtn: null
     };
@@ -53,10 +62,16 @@ const MintSorter = (() => {
         elements.inputs.currency = document.getElementById('w_currency');
         elements.inputs.capacity = document.getElementById('w_capacity');
         elements.inputs.latency = document.getElementById('w_latency');
+        elements.inputs.mints = document.getElementById('w_mints');
+        elements.inputs.melts = document.getElementById('w_melts');
+        elements.inputs.errors = document.getElementById('w_errors');
         
         elements.displays.currency = document.getElementById('val-curr');
         elements.displays.capacity = document.getElementById('val-cap');
         elements.displays.latency = document.getElementById('val-lat');
+        elements.displays.mints = document.getElementById('val-mints');
+        elements.displays.melts = document.getElementById('val-melts');
+        elements.displays.errors = document.getElementById('val-errors');
         
         elements.resetBtn = document.getElementById('reset-sort');
         
@@ -91,13 +106,15 @@ const MintSorter = (() => {
             };
         }
         
-        ['currency', 'capacity', 'latency'].forEach(key => {
+        ['currency', 'capacity', 'latency', 'mints', 'melts', 'errors'].forEach(key => {
             const input = elements.inputs[key];
             if (input) {
                 input.oninput = (e) => {
                     const val = parseInt(e.target.value, 10);
                     state.weights[key] = val;
-                    elements.displays[key].innerText = val;
+                    if (elements.displays[key]) {
+                        elements.displays[key].innerText = val;
+                    }
                     state.mode = 'weighted';
                     applySort();
                 };
@@ -113,7 +130,7 @@ const MintSorter = (() => {
                 // Reset UI
                 if (elements.inputs.status) elements.inputs.status.checked = DEFAULTS.status;
                 
-                ['currency', 'capacity', 'latency'].forEach(key => {
+                ['currency', 'capacity', 'latency', 'mints', 'melts', 'errors'].forEach(key => {
                     if (elements.inputs[key]) {
                         elements.inputs[key].value = DEFAULTS[key];
                     }
@@ -135,8 +152,8 @@ const MintSorter = (() => {
             state.mode = 'column';
             state.columnKey = key;
             state.direction = 'desc'; // Default to desc for most stats
-            if (key === 'latency' || key === 'url') {
-                state.direction = 'asc'; // Asc for latency/name usually better
+            if (key === 'latency' || key === 'url' || key === 'errors') {
+                state.direction = 'asc'; // Asc for latency/name/errors usually better
             }
         }
         applySort();
@@ -151,7 +168,10 @@ const MintSorter = (() => {
             capacity: parseInt(row.dataset.capacity || '0'),
             channels: parseInt(row.dataset.channels || '0'),
             currencies: parseInt(row.dataset.currencies || '0'),
-            latency: parseInt(row.dataset.latency || '99999')
+            latency: parseInt(row.dataset.latency || '99999'),
+            mints: parseInt(row.dataset.mints || '0'),
+            melts: parseInt(row.dataset.melts || '0'),
+            errors: parseInt(row.dataset.errors || '0')
         };
     }
 
@@ -172,11 +192,28 @@ const MintSorter = (() => {
         }
         
         // 4. Latency (penalty)
-        // If latency is unknown (99999), apply big penalty
         if (data.latency >= 99999) {
             score -= 1000 * state.weights.latency;
         } else {
             score -= data.latency * state.weights.latency;
+        }
+
+        // 5. Activity Stats (Mints/Melts) modulated by Errors
+        // "errors as metric should only modulate the impact of mints/melts and not be considered independently"
+        const activityScore = (data.mints * state.weights.mints) + (data.melts * state.weights.melts);
+        
+        if (activityScore > 0) {
+            const totalOps = data.mints + data.melts + data.errors;
+            const errorRate = totalOps > 0 ? (data.errors / totalOps) : 0;
+            
+            // Use weights.errors (default 100) as a percentage scaling factor for impact.
+            // 100 means 100% error rate removes 100% of activity score.
+            // 200 means 50% error rate removes 100% of activity score.
+            const penaltyFactor = errorRate * (state.weights.errors / 100);
+            
+            // Apply modulation (clamped to 0 to avoid negative activity score)
+            const modulation = Math.max(0, 1 - penaltyFactor);
+            score += activityScore * modulation;
         }
         
         return score;
