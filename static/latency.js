@@ -112,11 +112,17 @@ const LatencyMonitor = (() => {
             cell.textContent = '';
             cell.appendChild(badge);
         }
+        const row = cell.closest('tr');
+        if (row) {
+            row.dataset.latency = latency === null ? 99999 : latency;
+        }
     }
 
     function updateCurrenciesDisplay(cell, units) {
+        const row = cell.closest('tr');
         if (!units || units.length === 0) {
             cell.textContent = '-';
+            if (row) row.dataset.currencies = 0;
             return;
         }
         cell.textContent = '';
@@ -126,6 +132,9 @@ const LatencyMonitor = (() => {
             badge.textContent = unit;
             cell.appendChild(badge);
             cell.appendChild(document.createTextNode(' '));
+        }
+        if (row) {
+            row.dataset.currencies = units.length;
         }
     }
 
@@ -221,4 +230,3 @@ const LatencyMonitor = (() => {
 })();
 
 LatencyMonitor.init();
-

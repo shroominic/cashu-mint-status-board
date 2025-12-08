@@ -2,6 +2,7 @@ import asyncio
 import time
 import contextlib
 from dataclasses import dataclass
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 from decimal import Decimal, ROUND_HALF_UP
@@ -33,6 +34,7 @@ class HealthCheck(SQLModel, table=True):
     mint_id: int = Field(foreign_key="mint.id", index=True)
     status: bool
     response_ms: int | None = None
+    currency_count: int | None = None
     checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -68,6 +70,13 @@ def create_db() -> None:
                 "ALTER TABLE lightningsnapshot ADD COLUMN node_channel_count INTEGER"
             )
 
+        cols_hc = conn.exec_driver_sql("PRAGMA table_info('healthcheck')").fetchall()
+        names_hc = {c[1] for c in cols_hc}
+        if "currency_count" not in names_hc:
+            conn.exec_driver_sql(
+                "ALTER TABLE healthcheck ADD COLUMN currency_count INTEGER"
+            )
+
 
 async def fetch_nostr_mints() -> list[MintListing]:
     def _parse(event: dict[str, Any]) -> MintListing | None:
@@ -93,26 +102,74 @@ async def fetch_nostr_mints() -> list[MintListing]:
     ]
 
 
+async def fetch_audit_mints() -> list[str]:
+    urls = []
+    skip = 0
+    limit = 100
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while True:
+                r = await client.get(
+                    f"https://api.audit.8333.space/mints/?skip={skip}&limit={limit}"
+                )
+                if r.status_code != 200:
+                    break
+                data = r.json()
+                if not data:
+                    break
+
+                current_urls = [m["url"] for m in data if "url" in m]
+                urls.extend(current_urls)
+
+                if len(data) < limit:
+                    break
+                skip += limit
+
+                # Safety break to prevent infinite loops
+                if skip > 10000:
+                    break
+    except Exception:
+        pass
+    return urls
+
+
 def extract_url(mint: MintListing) -> str | None:
     return next((tag[1] for tag in mint.tags if len(tag) >= 2 and tag[0] == "u"), None)
 
 
 async def discover_mint_urls() -> list[str]:
-    mints = await fetch_nostr_mints()
-    urls = [u for m in mints if (u := extract_url(m))]
+    nostr_task = asyncio.create_task(fetch_nostr_mints())
+    audit_task = asyncio.create_task(fetch_audit_mints())
+
+    nostr_mints, audit_urls = await asyncio.gather(nostr_task, audit_task)
+    nostr_urls = [u for m in nostr_mints if (u := extract_url(m))]
+
+    urls = nostr_urls + audit_urls
     return sorted(set(urls))
 
 
 async def http_health(
     url: str, client: httpx.AsyncClient
-) -> tuple[str, bool, int | None]:
+) -> tuple[str, bool, int | None, int | None]:
     start = time.perf_counter()
     try:
         r = await client.get(f"{url.rstrip('/')}/v1/info")
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        return url, r.status_code == 200, elapsed_ms
+        if r.status_code == 200:
+            currencies = 0
+            try:
+                data = r.json()
+                nuts = data.get("nuts", {})
+                if "4" in nuts and "methods" in nuts["4"]:
+                    methods = nuts["4"]["methods"]
+                    # count unique units
+                    currencies = len({m[1] for m in methods if len(m) >= 2})
+            except Exception:
+                pass
+            return url, True, elapsed_ms, currencies
+        return url, False, elapsed_ms, None
     except Exception:
-        return url, False, None
+        return url, False, None, None
 
 
 def ensure_mints(session: Session, urls: list[str]) -> dict[str, int]:
@@ -134,9 +191,16 @@ async def monitor_loop(stop: asyncio.Event) -> None:
         async with httpx.AsyncClient(timeout=5.0) as client:
             results = await asyncio.gather(*[http_health(u, client) for u in urls])
         with Session(engine) as s:
-            url_to_id = ensure_mints(s, [u for u, _, _ in results])
-            for url, ok, ms in results:
-                s.add(HealthCheck(mint_id=url_to_id[url], status=ok, response_ms=ms))
+            url_to_id = ensure_mints(s, [u for u, _, _, _ in results])
+            for url, ok, ms, curs in results:
+                s.add(
+                    HealthCheck(
+                        mint_id=url_to_id[url],
+                        status=ok,
+                        response_ms=ms,
+                        currency_count=curs,
+                    )
+                )
             s.commit()
         try:
             await asyncio.wait_for(stop.wait(), timeout=60.0)
@@ -207,15 +271,20 @@ class MintRow:
     ln_capacity: str | None
     ln_channels: int | None
     avg_latency_ms: int | None
+    currencies: int | None
     is_up: bool
     uptime_class: str
     latency_class: str
+    # Raw values for sorting
+    raw_uptime: float
+    raw_capacity: int
+    raw_channels: int
 
 
 def compute_rows() -> list[MintRow]:
     now = datetime.now(timezone.utc)
     since_24h = now - timedelta(hours=24)
-    rows_with_metrics: list[tuple[int, float, int, MintRow]] = []
+    rows: list[MintRow] = []
     with Session(engine) as s:
         mints = s.exec(select(Mint).order_by(Mint.url)).all()
         for m in mints:
@@ -235,6 +304,15 @@ def compute_rows() -> list[MintRow]:
             )
             last50 = [hc.status for hc in recent]
             is_up = bool(recent and recent[0].status)
+            last_currencies = (
+                recent[0].currency_count
+                if recent and recent[0].currency_count is not None
+                else None
+            )
+
+            latencies = [hc.response_ms for hc in recent if hc.response_ms is not None]
+            avg_latency = int(sum(latencies) / len(latencies)) if latencies else None
+
             lns = s.exec(
                 select(LightningSnapshot)
                 .where(LightningSnapshot.mint_id == m.id)
@@ -274,6 +352,16 @@ def compute_rows() -> list[MintRow]:
                     else ("warn" if uptime_ratio >= 0.97 else "bad")
                 )
             )
+
+            latency_class = "none"
+            if avg_latency is not None:
+                if avg_latency < 200:
+                    latency_class = "fast"
+                elif avg_latency < 500:
+                    latency_class = "ok"
+                else:
+                    latency_class = "slow"
+
             row = MintRow(
                 url=m.url,
                 uptime_24h=(f"{(uptime_ratio*100):.0f}%" if total else "-"),
@@ -283,23 +371,31 @@ def compute_rows() -> list[MintRow]:
                 ln_name=node_name,
                 ln_capacity=cap_str,
                 ln_channels=channels,
-                avg_latency_ms=None,
+                avg_latency_ms=avg_latency,
+                currencies=last_currencies,
                 is_up=is_up,
                 uptime_class=uptime_class,
-                latency_class="none",
+                latency_class=latency_class,
+                raw_uptime=uptime_ratio,
+                raw_capacity=cap if cap is not None else 0,
+                raw_channels=channels if channels is not None else 0,
             )
-            cap_num = cap if cap is not None else -1
-            rows_with_metrics.append((cap_num, uptime_ratio, 0, row))
-    rows_with_metrics.sort(key=lambda t: (-t[0], -t[1], t[2]))
-    return [r for _, _, _, r in rows_with_metrics]
+            rows.append(row)
+
+    return rows
 
 
 def render_tbody() -> str:
     rows = compute_rows()
-    with_cap = [r for r in rows if r.ln_capacity is not None]
-    no_cap = [r for r in rows if r.ln_capacity is None]
 
-    def row_html(r: MintRow, extra_class: str = "") -> str:
+    # Just render all rows. Frontend handles sorting and grouping.
+    def row_html(r: MintRow) -> str:
+        # Determine base classes (up/down)
+        # Note: 'no-cap' class was used for styling previously,
+        # but since we want to unify, we can treat them similarly
+        # or still add the class if we want visual distinction.
+        # Let's keep 'no-cap' if capacity is missing for visual consistency.
+        extra_class = "no-cap" if r.ln_capacity is None else ""
         classes = (
             f"{'up' if r.is_up else 'down'}{(' ' + extra_class) if extra_class else ''}"
         )
@@ -313,34 +409,50 @@ def render_tbody() -> str:
             else "-"
         )
         channels_cell = f"{r.ln_channels}" if r.ln_channels is not None else "-"
+        currencies_cell = f"{r.currencies}" if r.currencies is not None else "-"
+
+        # Data attributes for JS sorting
+        data_attrs = (
+            f'data-url="{r.url}" '
+            f'data-up="{1 if r.is_up else 0}" '
+            f'data-uptime="{r.raw_uptime}" '
+            f'data-capacity="{r.raw_capacity}" '
+            f'data-channels="{r.raw_channels}" '
+            f'data-currencies="{r.currencies if r.currencies is not None else 0}" '
+            f'data-latency="{r.avg_latency_ms if r.avg_latency_ms is not None else 99999}"'
+        )
+
         return (
-            f"<tr class={classes}>"
+            f"<tr class='{classes}' {data_attrs}>"
             f"<td class=mint><span class=\"status-dot {'up' if r.is_up else 'down'}\" title=\"{'Up' if r.is_up else 'Down'}\"></span><a class=link href=\"{r.url}\" target=\"_blank\" rel=\"noopener\">{r.url.replace('https://','').replace('http://','')}</a></td>"
             f"<td><span class=\"badge uptime {r.uptime_class}\" title=\"Uptime last 24h\">{r.uptime_24h}</span></td>"
             f"<td><div class=spark>{r.checks_html}</div></td>"
             f"<td class=mono>{node_cell}</td>"
             f"<td>{channels_cell}</td>"
             f"<td>{(f'<span class=\'badge cap\'>{r.ln_capacity}</span>') if r.ln_capacity else '-'}</td>"
-            f"<td class=currencies>-</td>"
+            f"<td class=currencies>{currencies_cell}</td>"
             f"<td>{(f'<span class=\'badge latency {r.latency_class}\'>{r.avg_latency_ms} ms</span>') if r.avg_latency_ms is not None else '-'}</td>"
             f"</tr>"
         )
 
-    body_main = "".join(row_html(r) for r in with_cap)
-    body_no_cap = "".join(row_html(r, "no-cap") for r in no_cap)
-    divider = (
-        '<tr class="section-divider"><td colspan="8"><span>Node not found</span></td></tr>'
-        if body_no_cap
-        else ""
-    )
-    return f"<tbody id=dashboard>{body_main}{divider}{body_no_cap}</tbody>"
+    body = "".join(row_html(r) for r in rows)
+    return f"<tbody id=dashboard>{body}</tbody>"
 
 
 def render_table() -> str:
     tbody = render_tbody()
     return (
-        "<table class=card>"
-        "<thead><tr><th>Mint</th><th>Uptime (24h)</th><th>Last hour</th><th>LN Node</th><th>Channels</th><th>LN Capacity (BTC)</th><th>Currencies</th><th>Latency</th></tr></thead>"
+        "<table class=card id=mint-table>"
+        "<thead><tr>"
+        "<th class='sortable' data-key='url'>Mint</th>"
+        "<th class='sortable' data-key='uptime'>Uptime (24h)</th>"
+        "<th>Last hour</th>"
+        "<th class='sortable' data-key='ln_name'>LN Node</th>"
+        "<th class='sortable' data-key='channels'>Channels</th>"
+        "<th class='sortable' data-key='capacity'>LN Capacity (BTC)</th>"
+        "<th class='sortable' data-key='currencies'>Currencies</th>"
+        "<th class='sortable' data-key='latency'>Latency</th>"
+        "</tr></thead>"
         f"{tbody}"
         "</table>"
     )
@@ -358,6 +470,11 @@ def render_index() -> str:
     .card{width:100%;border-collapse:separate;border-spacing:0;background:linear-gradient(180deg,var(--surface),var(--surface-2));border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:0 10px 30px #00000055}
     th,td{padding:13px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:14px}
     thead th{position:sticky;top:0;background:#0c0f13;z-index:1;font-weight:600;color:#cbd5e1}
+    th.sortable{cursor:pointer;user-select:none}
+    th.sortable:hover{color:var(--accent)}
+    th.sortable::after{content:'';display:inline-block;width:10px;margin-left:5px}
+    th.asc::after{content:'▲'}
+    th.desc::after{content:'▼'}
     tbody tr{transition:background .15s ease}
     tbody tr:hover{background:#0f1217}
     tbody tr:last-child td{border-bottom:none}
@@ -387,7 +504,43 @@ def render_index() -> str:
     a:hover{text-decoration:underline}
     footer{max-width:1100px;margin:12px auto 0;padding:0 16px;color:var(--muted);font-size:12px}
     #meta{display:flex;gap:14px;align-items:center;margin-top:8px;color:var(--muted);font-size:12px}
+    details{margin-bottom:12px;margin-top:24px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px}
+    summary{cursor:pointer;font-weight:600;color:var(--muted);user-select:none}
+    summary:hover{color:var(--text)}
+    .config-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
+    .config-item{display:flex;flex-direction:column;gap:4px}
+    .config-item label{color:var(--muted);font-size:12px;font-weight:600}
+    .config-item input[type=range]{width:100%}
+    .config-item input[type=checkbox]{accent-color:var(--accent)}
+    .val{float:right;color:var(--text)}
     """.strip()
+
+    settings_form = """
+    <details open>
+        <summary>Ranking Configuration</summary>
+        <div class="config-grid">
+            <div class="config-item">
+                <label>Prioritize Online Status <input type="checkbox" id="w_status" checked></label>
+            </div>
+            <div class="config-item">
+                <label>Currency Bonus <span class="val" id="val-curr">1000</span></label>
+                <input type="range" id="w_currency" min="0" max="10000" step="100" value="1000">
+            </div>
+            <div class="config-item">
+                <label>Capacity Weight <span class="val" id="val-cap">500</span></label>
+                <input type="range" id="w_capacity" min="0" max="2000" step="50" value="500">
+            </div>
+            <div class="config-item">
+                <label>Latency Penalty <span class="val" id="val-lat">1</span></label>
+                <input type="range" id="w_latency" min="0" max="100" step="1" value="1">
+            </div>
+            <div class="config-item" style="justify-content:end">
+                 <button id="reset-sort" style="padding:4px 8px;cursor:pointer;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:4px">Reset to Weighted Score</button>
+            </div>
+        </div>
+    </details>
+    """
+
     return (
         "<!doctype html><html><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width, initial-scale=1">'
@@ -396,12 +549,14 @@ def render_index() -> str:
         f"<style>{styles}</style>"
         '<script src="https://unpkg.com/htmx.org@2.0.2" integrity="sha384-7Y/OLJm7GG4l7uYf4x2nY2hVqXzjP4uYbUhg0oMiJ2z2hQ0zDgANbHgxqCwR8K8y" crossorigin="anonymous"></script>'
         '<script src="/static/latency.js" defer></script>'
+        '<script src="/static/sorting.js" defer></script>'
         "</head><body>"
         "<header><h1>Cashu.Live</h1><div id=meta><span class=muted>Auto-refresh every 10s</span></div></header>"
         "<main>"
         '<div hx-get="/dashboard" hx-trigger="load, every 10s" hx-target="#dashboard" hx-swap="outerHTML">'
         f"{render_table()}"
         "</div>"
+        f"{settings_form}"
         "</main>"
         "</body></html>"
     )
