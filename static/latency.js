@@ -1,6 +1,8 @@
 const LatencyMonitor = (() => {
     const latencyCache = new Map();
     const pendingRequests = new Map();
+    const currencyCache = new Map();
+    const pendingCurrencyRequests = new Map();
     const CACHE_DURATION_MS = 10000;
     const REQUEST_TIMEOUT_MS = 5000;
     const REFRESH_INTERVAL_MS = 15000;
@@ -46,6 +48,52 @@ const LatencyMonitor = (() => {
         return measurePromise;
     }
 
+    async function fetchSupportedUnits(mintUrl) {
+        const cached = currencyCache.get(mintUrl);
+        if (cached && Date.now() - cached.timestamp < CACHE_DURATION_MS) {
+            return cached.units;
+        }
+
+        if (pendingCurrencyRequests.has(mintUrl)) {
+            return pendingCurrencyRequests.get(mintUrl);
+        }
+
+        const fetchPromise = (async () => {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+                const response = await fetch(`${mintUrl.replace(/\/$/, '')}/v1/keysets`, {
+                    method: 'GET',
+                    signal: controller.signal,
+                    cache: 'no-store'
+                });
+                clearTimeout(timeoutId);
+
+                if (!response.ok) {
+                    return null;
+                }
+                const data = await response.json();
+                const keysets = Array.isArray(data?.keysets) ? data.keysets : [];
+                const units = [...new Set(
+                    keysets
+                        .filter(ks => ks && ks.active === true && typeof ks.unit === 'string')
+                        .map(ks => ks.unit)
+                )];
+
+                currencyCache.set(mintUrl, { units, timestamp: Date.now() });
+                return units;
+            } catch (error) {
+                return null;
+            } finally {
+                pendingCurrencyRequests.delete(mintUrl);
+            }
+        })();
+
+        pendingCurrencyRequests.set(mintUrl, fetchPromise);
+        return fetchPromise;
+    }
+
     function getLatencyClass(latency) {
         if (latency === null) return 'none';
         if (latency <= 300) return 'fast';
@@ -63,6 +111,21 @@ const LatencyMonitor = (() => {
             badge.textContent = `${latency} ms`;
             cell.textContent = '';
             cell.appendChild(badge);
+        }
+    }
+
+    function updateCurrenciesDisplay(cell, units) {
+        if (!units || units.length === 0) {
+            cell.textContent = '-';
+            return;
+        }
+        cell.textContent = '';
+        for (const unit of units) {
+            const badge = document.createElement('span');
+            badge.className = 'badge unit';
+            badge.textContent = unit;
+            cell.appendChild(badge);
+            cell.appendChild(document.createTextNode(' '));
         }
     }
 
@@ -93,6 +156,18 @@ const LatencyMonitor = (() => {
                     updateLatencyDisplay(latencyCell, latency);
                 })
             );
+
+            const currenciesCell = row.querySelector('td.currencies');
+            if (currenciesCell) {
+                if (currenciesCell.textContent.trim() === '-') {
+                    currenciesCell.innerHTML = '<span class="badge unit">...</span>';
+                }
+                measurements.push(
+                    fetchSupportedUnits(mintUrl).then(units => {
+                        updateCurrenciesDisplay(currenciesCell, units);
+                    })
+                );
+            }
         }
 
         await Promise.all(measurements);
@@ -125,6 +200,7 @@ const LatencyMonitor = (() => {
     function startPeriodicRefresh() {
         setInterval(() => {
             latencyCache.clear();
+            currencyCache.clear();
             measureAllVisibleMints(true);
         }, REFRESH_INTERVAL_MS);
     }

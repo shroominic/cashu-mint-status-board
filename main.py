@@ -321,6 +321,7 @@ def render_tbody() -> str:
             f"<td class=mono>{node_cell}</td>"
             f"<td>{channels_cell}</td>"
             f"<td>{(f'<span class=\'badge cap\'>{r.ln_capacity}</span>') if r.ln_capacity else '-'}</td>"
+            f"<td class=currencies>-</td>"
             f"<td>{(f'<span class=\'badge latency {r.latency_class}\'>{r.avg_latency_ms} ms</span>') if r.avg_latency_ms is not None else '-'}</td>"
             f"</tr>"
         )
@@ -328,7 +329,7 @@ def render_tbody() -> str:
     body_main = "".join(row_html(r) for r in with_cap)
     body_no_cap = "".join(row_html(r, "no-cap") for r in no_cap)
     divider = (
-        '<tr class="section-divider"><td colspan="7"><span>Node not found</span></td></tr>'
+        '<tr class="section-divider"><td colspan="8"><span>Node not found</span></td></tr>'
         if body_no_cap
         else ""
     )
@@ -339,7 +340,7 @@ def render_table() -> str:
     tbody = render_tbody()
     return (
         "<table class=card>"
-        "<thead><tr><th>Mint</th><th>Uptime (24h)</th><th>Last hour</th><th>LN Node</th><th>Channels</th><th>LN Capacity (BTC)</th><th>Latency</th></tr></thead>"
+        "<thead><tr><th>Mint</th><th>Uptime (24h)</th><th>Last hour</th><th>LN Node</th><th>Channels</th><th>LN Capacity (BTC)</th><th>Currencies</th><th>Latency</th></tr></thead>"
         f"{tbody}"
         "</table>"
     )
@@ -381,6 +382,7 @@ def render_index() -> str:
     .badge.latency.ok{background:#2a2105;color:#f59e0b}
     .badge.latency.slow{background:#2d0c0c;color:#f87171}
     .badge.cap{background:#0f1318;color:#93c5fd}
+    .badge.unit{background:#0f1318;color:#a7f3d0}
     a{color:var(--accent);text-decoration:none}
     a:hover{text-decoration:underline}
     footer{max-width:1100px;margin:12px auto 0;padding:0 16px;color:var(--muted);font-size:12px}
