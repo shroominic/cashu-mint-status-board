@@ -472,6 +472,7 @@ def render_tbody() -> str:
         # Data attributes for JS sorting
         data_attrs = (
             f'data-url="{r.url}" '
+            f'data-name="{r.ln_name or ""}" '
             f'data-up="{1 if r.is_up else 0}" '
             f'data-uptime="{r.raw_uptime}" '
             f'data-capacity="{r.raw_capacity}" '
@@ -479,7 +480,7 @@ def render_tbody() -> str:
             f'data-currencies="{r.currencies if r.currencies is not None else 0}" '
             f'data-errors="{r.n_errors}" '
             f'data-mints="{r.n_mints}" '
-            f'data-melts="{r.n_melts}"'
+            f'data-melts="{r.n_melts}" '
             f'data-latency="{r.avg_latency_ms if r.avg_latency_ms is not None else 99999}" '
         )
 

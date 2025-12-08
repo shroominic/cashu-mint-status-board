@@ -163,15 +163,16 @@ const MintSorter = (() => {
         return {
             element: row,
             url: row.dataset.url,
-            isUp: parseInt(row.dataset.up || '0'),
+            ln_name: (row.dataset.name || '').toLowerCase(),
+            isUp: parseInt(row.dataset.up || '0', 10),
             uptime: parseFloat(row.dataset.uptime || '0'),
-            capacity: parseInt(row.dataset.capacity || '0'),
-            channels: parseInt(row.dataset.channels || '0'),
-            currencies: parseInt(row.dataset.currencies || '0'),
-            latency: parseInt(row.dataset.latency || '99999'),
-            mints: parseInt(row.dataset.mints || '0'),
-            melts: parseInt(row.dataset.melts || '0'),
-            errors: parseInt(row.dataset.errors || '0')
+            capacity: parseInt(row.dataset.capacity || '0', 10),
+            channels: parseInt(row.dataset.channels || '0', 10),
+            currencies: parseInt(row.dataset.currencies || '0', 10),
+            latency: parseInt(row.dataset.latency || '99999', 10),
+            mints: parseInt(row.dataset.mints || '0', 10),
+            melts: parseInt(row.dataset.melts || '0', 10),
+            errors: parseInt(row.dataset.errors || '0', 10)
         };
     }
 
@@ -236,12 +237,6 @@ const MintSorter = (() => {
                 let valA = a[state.columnKey];
                 let valB = b[state.columnKey];
                 
-                if (state.columnKey === 'ln_name') {
-                    // Dirty hack: read text content of 4th column
-                    valA = a.element.children[3].innerText.trim();
-                    valB = b.element.children[3].innerText.trim();
-                }
-
                 if (valA < valB) return state.direction === 'asc' ? -1 : 1;
                 if (valA > valB) return state.direction === 'asc' ? 1 : -1;
                 return 0;
