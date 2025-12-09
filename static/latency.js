@@ -149,8 +149,8 @@ const LatencyMonitor = (() => {
 
             let mintUrl = linkElement.href;
 
-            // Force HTTPS for all mints
-            if (mintUrl.startsWith('http:')) {
+            // Force HTTPS only if we are on HTTPS (to avoid Mixed Content)
+            if (window.location.protocol === 'https:' && mintUrl.startsWith('http:')) {
                 mintUrl = mintUrl.replace('http:', 'https:');
             }
 
