@@ -144,28 +144,48 @@ def extract_url(mint: MintListing) -> str | None:
     return next((tag[1] for tag in mint.tags if len(tag) >= 2 and tag[0] == "u"), None)
 
 
+def normalize_url(url: str) -> str:
+    u = url.lower().strip()
+    if u.startswith("https://"):
+        u = u[8:]
+    elif u.startswith("http://"):
+        u = u[7:]
+    return u.rstrip("/")
+
+
 async def discover_mint_urls() -> dict[str, dict[str, Any] | None]:
     nostr_task = asyncio.create_task(fetch_nostr_mints())
     audit_task = asyncio.create_task(fetch_audit_mints())
 
     nostr_mints, audit_data = await asyncio.gather(nostr_task, audit_task)
 
-    # Map URL to extra data (or None)
-    result: dict[str, dict[str, Any] | None] = {}
+    # Map normalized URL to (original_url, extra_data)
+    # We prioritize the original_url from Nostr if available, otherwise from Audit
+    normalized_map: dict[str, dict[str, Any]] = {}
 
     # Process Nostr mints
     for m in nostr_mints:
         if u := extract_url(m):
-            if u not in result:
-                result[u] = None
+            norm = normalize_url(u)
+            if norm not in normalized_map:
+                normalized_map[norm] = {"url": u, "data": None}
 
     # Process Audit mints
     for m in audit_data:
         if isinstance(m, dict) and "url" in m:
             u = m["url"]
-            # We merge/overwrite because audit data has stats we want
-            # If we already have it from Nostr, we just attach the stats
-            result[u] = m  # type: ignore[index]
+            norm = normalize_url(u)
+            if norm in normalized_map:
+                # Update existing entry with stats
+                normalized_map[norm]["data"] = m
+            else:
+                # New entry from Audit
+                normalized_map[norm] = {"url": u, "data": m}
+
+    # Reconstruct result
+    result: dict[str, dict[str, Any] | None] = {}
+    for entry in normalized_map.values():
+        result[entry["url"]] = entry["data"]
 
     return result
 
@@ -591,28 +611,32 @@ def render_index() -> str:
                 <label>Prioritize Online Status <input type="checkbox" id="w_status" checked></label>
             </div>
             <div class="config-item">
-                <label>Currency Bonus <span class="val" id="val-curr">1000</span></label>
-                <input type="range" id="w_currency" min="0" max="10000" step="100" value="1000">
+                <label>Currency Bonus <span class="val" id="val-curr">50</span></label>
+                <input type="range" id="w_currency" min="0" max="1000" step="10" value="50">
             </div>
             <div class="config-item">
-                <label>Capacity Weight <span class="val" id="val-cap">500</span></label>
-                <input type="range" id="w_capacity" min="0" max="2000" step="50" value="500">
+                <label>Capacity Weight <span class="val" id="val-cap">5000</span></label>
+                <input type="range" id="w_capacity" min="0" max="10000" step="100" value="5000">
             </div>
             <div class="config-item">
-                <label>Mints Weight <span class="val" id="val-mints">10</span></label>
-                <input type="range" id="w_mints" min="0" max="100" step="1" value="10">
+                <label>Channels Weight <span class="val" id="val-chan">20</span></label>
+                <input type="range" id="w_channels" min="0" max="100" step="1" value="20">
             </div>
             <div class="config-item">
-                <label>Melts Weight <span class="val" id="val-melts">10</span></label>
-                <input type="range" id="w_melts" min="0" max="100" step="1" value="10">
+                <label>Mints Weight <span class="val" id="val-mints">50</span></label>
+                <input type="range" id="w_mints" min="0" max="200" step="1" value="50">
             </div>
             <div class="config-item">
-                <label>Errors Penalty <span class="val" id="val-errors">100</span></label>
-                <input type="range" id="w_errors" min="0" max="1000" step="10" value="100">
+                <label>Melts Weight <span class="val" id="val-melts">50</span></label>
+                <input type="range" id="w_melts" min="0" max="200" step="1" value="50">
             </div>
             <div class="config-item">
-                <label>Latency Penalty <span class="val" id="val-lat">1</span></label>
-                <input type="range" id="w_latency" min="0" max="100" step="1" value="1">
+                <label>Errors Penalty <span class="val" id="val-errors">200</span></label>
+                <input type="range" id="w_errors" min="0" max="1000" step="10" value="200">
+            </div>
+            <div class="config-item">
+                <label>Latency Penalty <span class="val" id="val-lat">5</span></label>
+                <input type="range" id="w_latency" min="0" max="100" step="1" value="5">
             </div>
             <div class="config-item" style="justify-content:end">
                  <button id="reset-sort" style="padding:4px 8px;cursor:pointer;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:4px">Reset to Weighted Score</button>
