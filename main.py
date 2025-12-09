@@ -174,13 +174,14 @@ async def discover_mint_urls() -> dict[str, dict[str, Any] | None]:
     for m in audit_data:
         if isinstance(m, dict) and "url" in m:
             u = m["url"]
-            norm = normalize_url(u)
-            if norm in normalized_map:
-                # Update existing entry with stats
-                normalized_map[norm]["data"] = m
-            else:
-                # New entry from Audit
-                normalized_map[norm] = {"url": u, "data": m}
+            if isinstance(u, str):
+                norm = normalize_url(u)
+                if norm in normalized_map:
+                    # Update existing entry with stats
+                    normalized_map[norm]["data"] = m
+                else:
+                    # New entry from Audit
+                    normalized_map[norm] = {"url": u, "data": m}
 
     # Reconstruct result
     result: dict[str, dict[str, Any] | None] = {}
@@ -194,30 +195,41 @@ async def http_health(
     url: str, client: httpx.AsyncClient
 ) -> tuple[str, bool, int | None, int | None]:
     start = time.perf_counter()
-    try:
-        r = await client.get(f"{url.rstrip('/')}/v1/info")
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        if r.status_code == 200:
-            currencies = 0
-            try:
-                data = r.json()
-                nuts = data.get("nuts", {})
-                if "4" in nuts and "methods" in nuts["4"]:
-                    methods = nuts["4"]["methods"]
-                    # count unique units
-                    units = set()
-                    for m in methods:
-                        if isinstance(m, dict):
-                            units.add(m.get("unit"))
-                        elif isinstance(m, (list, tuple)) and len(m) >= 2:
-                            units.add(m[1])
-                    currencies = len({u for u in units if u})
-            except Exception:
-                pass
-            return url, True, elapsed_ms, currencies
-        return url, False, elapsed_ms, None
-    except Exception:
-        return url, False, None, None
+
+    u = url.rstrip("/")
+    if u.startswith("https://"):
+        u = u[8:]
+    elif u.startswith("http://"):
+        u = u[7:]
+
+    targets = [f"https://{u}", f"http://{u}"]
+
+    for target in targets:
+        try:
+            r = await client.get(f"{target}/v1/info")
+            if r.status_code == 200:
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                currencies = 0
+                try:
+                    data = r.json()
+                    nuts = data.get("nuts", {})
+                    if "4" in nuts and "methods" in nuts["4"]:
+                        methods = nuts["4"]["methods"]
+                        # count unique units
+                        units = set()
+                        for m in methods:
+                            if isinstance(m, dict):
+                                units.add(m.get("unit"))
+                            elif isinstance(m, (list, tuple)) and len(m) >= 2:
+                                units.add(m[1])
+                        currencies = len({x for x in units if x})
+                except Exception:
+                    pass
+                return url, True, elapsed_ms, currencies
+        except Exception:
+            pass
+
+    return url, False, None, None
 
 
 def ensure_mints(session: Session, urls: list[str]) -> dict[str, int]:

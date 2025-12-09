@@ -18,16 +18,26 @@ class LightningProbeResult:
 async def fetch_invoice_request(
     mint_url: str, client: httpx.AsyncClient
 ) -> tuple[str | None, dict[str, Any] | None]:
-    endpoint = f"{mint_url.rstrip('/')}/v1/mint/quote/bolt11"
-    try:
-        r = await client.post(endpoint, json={"unit": "sat", "amount": 100})
-        if r.status_code != 200:
-            return None, None
-        data = r.json()
-        invoice = data.get("request") or data.get("bolt11")
-        return (invoice if isinstance(invoice, str) else None), data
-    except Exception:
-        return None, None
+    u = mint_url.rstrip("/")
+    if u.startswith("https://"):
+        u = u[8:]
+    elif u.startswith("http://"):
+        u = u[7:]
+
+    targets = [f"https://{u}", f"http://{u}"]
+
+    for base in targets:
+        endpoint = f"{base}/v1/mint/quote/bolt11"
+        try:
+            r = await client.post(endpoint, json={"unit": "sat", "amount": 100})
+            if r.status_code == 200:
+                data = r.json()
+                invoice = data.get("request") or data.get("bolt11")
+                return (invoice if isinstance(invoice, str) else None), data
+        except Exception:
+            pass
+
+    return None, None
 
 
 def decode_invoice_pubkey(invoice: str) -> str | None:
